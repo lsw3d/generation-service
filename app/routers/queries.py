@@ -1,7 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -14,6 +14,7 @@ router = APIRouter()
 
 @router.get("/tasks/{task_id}", response_model=TaskOut)
 async def get_task(task_id: uuid.UUID, session: AsyncSession = Depends(get_session)):
+    await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
     task = (
         await session.execute(
             select(Task).options(selectinload(Task.attempts)).where(Task.id == task_id)
@@ -44,7 +45,7 @@ async def get_task(task_id: uuid.UUID, session: AsyncSession = Depends(get_sessi
             external_id=a.external_id,
             leg_priority=a.leg_priority,
         )
-        for a in sorted(task.attempts, key=lambda a: a.created_at)
+        for a in sorted(task.attempts, key=lambda a: a.leg_priority)
     ]
     return TaskOut(
         id=task.id,
@@ -58,6 +59,8 @@ async def get_task(task_id: uuid.UUID, session: AsyncSession = Depends(get_sessi
 
 @router.get("/users/{user_id}/balance", response_model=BalanceOut)
 async def get_balance(user_id: uuid.UUID, session: AsyncSession = Depends(get_session)):
+    # Both SELECTs must describe one committed snapshot under concurrent credits.
+    await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
     user = await session.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="user not found")
@@ -65,7 +68,7 @@ async def get_balance(user_id: uuid.UUID, session: AsyncSession = Depends(get_se
         await session.execute(
             select(LedgerEntry)
             .where(LedgerEntry.user_id == user_id)
-            .order_by(LedgerEntry.created_at.desc())
+            .order_by(LedgerEntry.created_at.desc(), LedgerEntry.id.desc())
             .limit(20)
         )
     ).scalars()
