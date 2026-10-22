@@ -1,19 +1,18 @@
-import asyncio
-import json
-import logging
-import uuid
-
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import get_session
 from app.hmac_util import verify_signature
-from app.schemas import PaymentWebhook
-from app.services.billing import apply_payment
-from app.services.orchestration import apply_provider_completed, apply_provider_failed, dispatch_until_waiting_or_done
+from app.schemas import PaymentWebhook, ProviderWebhook
+from app.services.billing import PaymentConflict, apply_payment
+from app.services.orchestration import (
+    apply_provider_completed,
+    apply_provider_failed,
+    dispatch_until_waiting_or_done,
+)
 
-log = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -27,54 +26,58 @@ def _require_signature(body: bytes, request: Request) -> None:
 async def payments_webhook(request: Request, session: AsyncSession = Depends(get_session)):
     raw = await request.body()
     _require_signature(raw, request)
-    payload = PaymentWebhook.model_validate_json(raw)
-    applied = await apply_payment(
-        session,
-        payment_id=payload.payment_id,
-        user_id=payload.user_id,
-        tokens=payload.tokens,
-        status=payload.status,
-    )
+    try:
+        payload = PaymentWebhook.model_validate_json(raw)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail="invalid payment payload") from exc
+    try:
+        applied = await apply_payment(
+            session,
+            payment_id=payload.payment_id,
+            user_id=payload.user_id,
+            tokens=payload.tokens,
+            status=payload.status,
+        )
+    except PaymentConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     await session.commit()
     return {"ok": True, "applied": applied}
 
 
 @router.post("/webhooks/providers/{name}")
-async def provider_webhook(name: str, request: Request, session: AsyncSession = Depends(get_session)):
+async def provider_webhook(
+    name: str, request: Request, background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
     if name not in ("alpha", "beta"):
         raise HTTPException(status_code=404, detail="unknown provider")
     raw = await request.body()
     _require_signature(raw, request)
-    data = json.loads(raw)
+    try:
+        payload = ProviderWebhook.model_validate_json(raw)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail="invalid provider payload") from exc
 
-    attempt_id = uuid.UUID(data["attempt_id"]) if data.get("attempt_id") else None
-    external_id = data.get("external_id")
-    status = data.get("status")
-
-    if status == "completed":
+    if payload.status == "completed":
         await apply_provider_completed(
             session,
             provider_name=name,
-            attempt_id=attempt_id,
-            external_id=external_id,
-            result_url=data.get("result_url"),
+            attempt_id=payload.attempt_id,
+            external_id=payload.external_id,
+            result_url=payload.result_url,
         )
         await session.commit()
         return {"ok": True}
-
-    if status == "failed":
-        error_type = data.get("error_type") or "technical"
+    if payload.status == "failed":
         task_id = await apply_provider_failed(
             session,
             provider_name=name,
-            attempt_id=attempt_id,
-            external_id=external_id,
-            error_type=error_type,
+            attempt_id=payload.attempt_id,
+            external_id=payload.external_id,
+            error_type=payload.error_type,
         )
         await session.commit()
         if task_id is not None:
             # Failover HTTP must not run inside the webhook transaction.
-            asyncio.create_task(dispatch_until_waiting_or_done(task_id))
+            background_tasks.add_task(dispatch_until_waiting_or_done, task_id)
         return {"ok": True}
-
-    raise HTTPException(status_code=400, detail="unknown status")

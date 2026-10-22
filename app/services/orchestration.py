@@ -1,9 +1,7 @@
-import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -21,9 +19,6 @@ from app.models import (
 )
 from app.services.billing import charge_task, refund_task
 from app.services.provider_client import submit_task
-
-log = logging.getLogger(__name__)
-
 
 class GenerateError(Exception):
     def __init__(self, status_code: int, detail: str):
@@ -79,7 +74,7 @@ async def create_generation(
         await session.execute(select(User).where(User.id == user_id).with_for_update())
     ).scalar_one_or_none()
     if user is None:
-        raise GenerateError(404, "unknown user")
+        raise GenerateError(402, "insufficient tokens")
 
     active = (
         await session.execute(
@@ -105,22 +100,18 @@ async def create_generation(
         price_tokens=model.price_tokens,
     )
     session.add(task)
-    try:
-        await session.flush()
-        await charge_task(session, user_id=user_id, task_id=task.id, amount=model.price_tokens)
-        session.add(
-            Attempt(
-                task_id=task.id,
-                provider_name=first.provider_name,
-                leg_priority=first.priority,
-                status=AttemptStatus.sending,
-            )
+    await session.flush()
+    await charge_task(session, user_id=user_id, task_id=task.id, amount=model.price_tokens)
+    session.add(
+        Attempt(
+            task_id=task.id,
+            provider_name=first.provider_name,
+            leg_priority=first.priority,
+            status=AttemptStatus.sending,
         )
-        task_id = task.id
-        await session.commit()
-    except IntegrityError as exc:
-        await session.rollback()
-        raise GenerateError(402, "insufficient tokens") from exc
+    )
+    task_id = task.id
+    await session.commit()
     await dispatch_until_waiting_or_done(task_id)
     return task_id
 
@@ -133,13 +124,17 @@ async def _open_attempt(session: AsyncSession, task_id: uuid.UUID) -> Attempt | 
                 Attempt.task_id == task_id,
                 Attempt.status.in_([AttemptStatus.sending, AttemptStatus.waiting]),
             )
-            .with_for_update()
+            .with_for_update(skip_locked=True)
         )
     ).scalar_one_or_none()
 
 
 async def dispatch_until_waiting_or_done(task_id: uuid.UUID) -> None:
-    """Send the current open attempt; on sync failure keep failing over."""
+    """One dispatcher owns the row until POST is recorded or rolled back.
+
+    A process crash leaves a durable sending row for another watchdog to retry.
+    The provider deduplicates retries by attempt_id if it already accepted POST.
+    """
     while True:
         async with SessionLocal() as session:
             attempt = await _open_attempt(session, task_id)
@@ -147,14 +142,7 @@ async def dispatch_until_waiting_or_done(task_id: uuid.UUID) -> None:
                 return
             payload = await _provider_payload(session, attempt)
             base = provider_url(attempt.provider_name)
-            attempt_id = attempt.id
-
-        result = await submit_task(base, payload)
-
-        async with SessionLocal() as session:
-            attempt = await session.get(Attempt, attempt_id, with_for_update=True)
-            if attempt is None or attempt.status != AttemptStatus.sending:
-                return
+            result = await submit_task(base, payload)
             if result.accepted and result.external_id:
                 attempt.external_id = result.external_id
                 attempt.status = AttemptStatus.waiting
@@ -308,13 +296,14 @@ async def claim_expired_attempts(session: AsyncSession) -> list[uuid.UUID]:
         await session.execute(
             select(Attempt)
             .where(
-                or_(
-                    (Attempt.status == AttemptStatus.sending) & (Attempt.created_at < cutoff),
-                    (Attempt.status == AttemptStatus.waiting) & (Attempt.waiting_since < cutoff),
-                )
+                Attempt.status == AttemptStatus.waiting,
+                Attempt.waiting_since < cutoff,
             )
+            .order_by(Attempt.waiting_since, Attempt.id)
             .with_for_update(skip_locked=True)
-            .limit(25)
+            # One refund per transaction avoids cross-user lock inversions
+            # between watchdog batches in different processes.
+            .limit(1)
         )
     ).scalars()
     all_attempts = list(attempts)

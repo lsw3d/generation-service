@@ -1,11 +1,14 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import LedgerEntry, LedgerKind, User
+
+
+class PaymentConflict(Exception):
+    """A payment identifier cannot describe two different credits."""
 
 
 async def ensure_user_locked(session: AsyncSession, user_id: uuid.UUID) -> User:
@@ -29,20 +32,23 @@ async def apply_payment(
         return False
 
     await ensure_user_locked(session, user_id)
-    try:
-        async with session.begin_nested():
-            session.add(
-                LedgerEntry(
-                    user_id=user_id,
-                    amount=tokens,
-                    kind=LedgerKind.payment,
-                    payment_id=payment_id,
-                )
-            )
-            await session.flush()
-    except IntegrityError:
-        return False
-    return True
+    inserted = await session.scalar(
+        pg_insert(LedgerEntry)
+        .values(user_id=user_id, amount=tokens, kind=LedgerKind.payment, payment_id=payment_id)
+        .on_conflict_do_nothing(
+            index_elements=[LedgerEntry.payment_id],
+            index_where=LedgerEntry.payment_id.is_not(None),
+        )
+        .returning(LedgerEntry.id)
+    )
+    if inserted is not None:
+        return True
+    existing = (await session.scalars(
+        select(LedgerEntry).where(LedgerEntry.payment_id == payment_id)
+    )).one()
+    if existing.user_id != user_id or existing.amount != tokens:
+        raise PaymentConflict("payment_id already belongs to a different credit")
+    return False
 
 
 async def charge_task(
@@ -71,17 +77,15 @@ async def refund_task(
     amount: int,
 ) -> bool:
     """Insert the single refund row. Unique index makes a second insert a no-op."""
-    try:
-        async with session.begin_nested():
-            session.add(
-                LedgerEntry(
-                    user_id=user_id,
-                    amount=amount,
-                    kind=LedgerKind.refund,
-                    task_id=task_id,
-                )
-            )
-            await session.flush()
-    except IntegrityError:
-        return False
-    return True
+    inserted = await session.scalar(
+        pg_insert(LedgerEntry)
+        .values(user_id=user_id, amount=amount, kind=LedgerKind.refund, task_id=task_id)
+        .on_conflict_do_nothing(
+            index_elements=[LedgerEntry.task_id],
+            # Keep the partial-index predicate literal: a generic prepared
+            # plan cannot prove that a parameter always means 'refund'.
+            index_where=text("kind = 'refund' AND task_id IS NOT NULL"),
+        )
+        .returning(LedgerEntry.id)
+    )
+    return inserted is not None

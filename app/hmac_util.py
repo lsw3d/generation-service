@@ -10,4 +10,6 @@ def verify_signature(secret: str, body: bytes, signature: str | None) -> bool:
     if not signature:
         return False
     expected = sign_body(secret, body)
-    return hmac.compare_digest(expected, signature)
+    # Header values are not guaranteed to be ASCII. Comparing str values with
+    # non-ASCII characters raises TypeError instead of rejecting the signature.
+    return hmac.compare_digest(expected.encode("ascii"), signature.encode("utf-8"))

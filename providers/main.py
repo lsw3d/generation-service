@@ -8,8 +8,12 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.db import SessionLocal
 from app.hmac_util import sign_body
+from app.models import ProviderReceipt
 
 PROVIDER_NAME = os.environ.get("PROVIDER_NAME", "alpha")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "http://localhost:8000/webhooks/providers/alpha")
@@ -31,7 +35,7 @@ class Settings(BaseModel):
 
 
 class TaskIn(BaseModel):
-    attempt_id: str
+    attempt_id: uuid.UUID
     prompt: str
     ref_images: list[str] = Field(default_factory=list)
 
@@ -55,15 +59,36 @@ async def get_settings():
 
 @app.post("/tasks", status_code=202)
 async def create_task(body: TaskIn):
+    async with SessionLocal() as session:
+        existing = await session.get(ProviderReceipt, (PROVIDER_NAME, body.attempt_id))
+        if existing is not None:
+            return {"external_id": str(existing.external_id)}
+
     current = settings
     if current.sync_fail == "503":
         raise HTTPException(status_code=503, detail="unavailable")
     if current.sync_fail == "timeout":
         await asyncio.sleep(3600)
 
-    external_id = str(uuid.uuid4())
-    asyncio.create_task(_deliver_webhook(body.attempt_id, external_id, current.model_copy()))
-    return {"external_id": external_id}
+    async with SessionLocal() as session:
+        inserted = await session.scalar(
+            pg_insert(ProviderReceipt)
+            .values(provider_name=PROVIDER_NAME, attempt_id=body.attempt_id)
+            .on_conflict_do_nothing()
+            .returning(ProviderReceipt.external_id)
+        )
+        external_id = inserted or await session.scalar(
+            select(ProviderReceipt.external_id).where(
+                ProviderReceipt.provider_name == PROVIDER_NAME,
+                ProviderReceipt.attempt_id == body.attempt_id,
+            )
+        )
+        await session.commit()
+    if inserted is not None:
+        asyncio.create_task(_deliver_webhook(
+            str(body.attempt_id), str(external_id), current.model_copy()
+        ))
+    return {"external_id": str(external_id)}
 
 
 async def _deliver_webhook(attempt_id: str, external_id: str, cfg: Settings) -> None:

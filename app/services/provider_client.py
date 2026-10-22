@@ -19,6 +19,11 @@ async def submit_task(base_url: str, payload: dict) -> SubmitResult:
         return SubmitResult(accepted=False)
 
     if response.status_code == 202:
-        data = response.json()
-        return SubmitResult(accepted=True, external_id=data["external_id"])
+        try:
+            data = response.json()
+        except ValueError:
+            return SubmitResult(accepted=False)
+        external_id = data.get("external_id") if isinstance(data, dict) else None
+        if isinstance(external_id, str) and 0 < len(external_id) <= 64:
+            return SubmitResult(accepted=True, external_id=external_id)
     return SubmitResult(accepted=False)

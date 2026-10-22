@@ -51,6 +51,7 @@ services:
     build: .
     command: ["uvicorn", "providers.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
     environment:
+      DATABASE_URL: postgresql+asyncpg://gen:gen@db:5432/gen
       PROVIDER_NAME: alpha
       WEBHOOK_SECRET: test-secret
       WEBHOOK_URL: http://api:8000/webhooks/providers/alpha
@@ -62,6 +63,7 @@ services:
     build: .
     command: ["uvicorn", "providers.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
     environment:
+      DATABASE_URL: postgresql+asyncpg://gen:gen@db:5432/gen
       PROVIDER_NAME: beta
       WEBHOOK_SECRET: test-secret
       WEBHOOK_URL: http://api:8000/webhooks/providers/beta

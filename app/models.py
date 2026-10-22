@@ -173,3 +173,15 @@ class Attempt(Base):
     )
 
     task: Mapped[Task] = relationship(back_populates="attempts")
+
+
+class ProviderReceipt(Base):
+    """Fake providers persist POST deduplication across process restarts."""
+
+    __tablename__ = "provider_receipts"
+
+    provider_name: Mapped[str] = mapped_column(String(32), primary_key=True)
+    attempt_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    external_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, server_default=func.gen_random_uuid()
+    )
